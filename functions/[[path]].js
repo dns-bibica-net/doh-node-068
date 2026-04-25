@@ -512,20 +512,52 @@ function ipv6ToBytes(ip) {
 }
 
 // ==================== DNS REDIRECT ====================
-// Encode domain string to DNS wire format (e.g. "www.example.com" → [3,w,w,w,7,e,x,a,m,p,l,e,3,c,o,m,0])
 function encodeDomainName(domain) {
-  const labels = domain.split('.');
-  const parts = [];
-  for (const label of labels) {
-    if (label.length === 0) continue;
-    parts.push(label.length);
-    for (let i = 0; i < label.length; i++) parts.push(label.charCodeAt(i));
+  if (!domain || domain === '.') return new Uint8Array([0]);
+  const parts = domain.replace(/\.$/, '').split('.');
+  let totalLen = 0;
+  for (const p of parts) totalLen += p.length + 1;
+  const buf = new Uint8Array(totalLen + 1);
+  let off = 0;
+  for (const p of parts) {
+    buf[off++] = p.length;
+    for (let i = 0; i < p.length; i++) buf[off++] = p.charCodeAt(i);
   }
-  parts.push(0); // root terminator
-  return new Uint8Array(parts);
+  buf[off++] = 0;
+  return buf;
 }
 
-// Rewrite QNAME in query buffer to target domain
+function decodeName(v, startOff) {
+  let labels = [];
+  let curr = startOff;
+  let jumped = false;
+  let nextOff = -1;
+  let depth = 0;
+  while (depth < 20 && curr < v.length) {
+    const b = v[curr];
+    if (b === 0) {
+      if (!jumped) nextOff = curr + 1;
+      curr++;
+      break;
+    }
+    if ((b & 0xC0) === 0xC0) {
+      if (curr + 1 >= v.length) break;
+      const ptr = ((b & 0x3F) << 8) | v[curr + 1];
+      if (!jumped) nextOff = curr + 2;
+      jumped = true;
+      curr = ptr;
+      depth++;
+    } else {
+      const l = v[curr++];
+      if (curr + l > v.length) break;
+      let label = "";
+      for (let i = 0; i < l; i++) label += String.fromCharCode(v[curr++]);
+      labels.push(label);
+    }
+  }
+  return { name: labels.length === 0 ? "." : labels.join('.'), nextOff: jumped ? nextOff : curr };
+}
+
 function rewriteQname(query, targetDomain) {
   const v = new Uint8Array(query);
   if (v.length < 12) return query;
@@ -537,7 +569,7 @@ function rewriteQname(query, targetDomain) {
     qnameEnd += len + 1;
   }
   const targetWire = encodeDomainName(targetDomain);
-  const afterQname = v.subarray(qnameEnd); // QTYPE + QCLASS + rest
+  const afterQname = v.subarray(qnameEnd);
   const result = new Uint8Array(12 + targetWire.length + afterQname.length);
   result.set(v.subarray(0, 12));
   result.set(targetWire, 12);
@@ -545,36 +577,22 @@ function rewriteQname(query, targetDomain) {
   return result.buffer;
 }
 
-// Rebuild response: original QNAME + CNAME(original→target) + answer records from upstream
-// Avoids pointer corruption by writing all names uncompressed (except CNAME NAME uses 0xC00C)
 function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, targetDomain) {
   const uv = new Uint8Array(upstreamResponse);
   const qv = new Uint8Array(originalQuery);
   if (uv.length < 12 || qv.length < 12) return upstreamResponse;
 
-  // Parse upstream: skip question section
   let uOff = 12;
   const uQd = (uv[4] << 8) | uv[5];
   for (let i = 0; i < uQd; i++) {
-    while (uOff < uv.length) {
-      const l = uv[uOff];
-      if (l === 0) { uOff++; break; }
-      if ((l & 0xC0) === 0xC0) { uOff += 2; break; }
-      uOff += l + 1;
-    }
-    uOff += 4;
+    uOff = decodeName(uv, uOff).nextOff + 4;
   }
 
-  // Extract answer records: skip compressed NAME, read TYPE/CLASS/TTL/RDATA raw
   const anCount = (uv[6] << 8) | uv[7];
   const ansRecords = [];
   for (let i = 0; i < anCount && uOff < uv.length; i++) {
-    while (uOff < uv.length) {
-      const l = uv[uOff];
-      if (l === 0) { uOff++; break; }
-      if ((l & 0xC0) === 0xC0) { uOff += 2; break; }
-      uOff += l + 1;
-    }
+    const dn = decodeName(uv, uOff);
+    uOff = dn.nextOff;
     if (uOff + 10 > uv.length) break;
     const type = (uv[uOff] << 8) | uv[uOff + 1];
     const cls = (uv[uOff + 2] << 8) | uv[uOff + 3];
@@ -582,55 +600,58 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
     const rdlen = (uv[uOff + 8] << 8) | uv[uOff + 9];
     uOff += 10;
     if (uOff + rdlen > uv.length) break;
-    ansRecords.push({ type, cls, ttl, rdata: uv.slice(uOff, uOff + rdlen) });
+
+    let rdata = uv.slice(uOff, uOff + rdlen);
+    if (type === 5 || type === 2 || type === 12) { // CNAME, NS, PTR
+      rdata = encodeDomainName(decodeName(uv, uOff).name);
+    } else if (type === 15) { // MX
+      const pref = uv.slice(uOff, uOff + 2);
+      const name = encodeDomainName(decodeName(uv, uOff + 2).name);
+      const combined = new Uint8Array(2 + name.length);
+      combined.set(pref); combined.set(name, 2);
+      rdata = combined;
+    } else if (type === 33) { // SRV
+      const fixed = uv.slice(uOff, uOff + 6);
+      const name = encodeDomainName(decodeName(uv, uOff + 6).name);
+      const combined = new Uint8Array(6 + name.length);
+      combined.set(fixed); combined.set(name, 6);
+      rdata = combined;
+    }
+    ansRecords.push({ type, cls, ttl, rdata });
     uOff += rdlen;
   }
 
-  // Find end of original query's question section
   let oQEnd = 12;
-  while (oQEnd < qv.length) {
-    const l = qv[oQEnd];
-    if (l === 0) { oQEnd++; break; }
-    if ((l & 0xC0) === 0xC0) { oQEnd += 2; break; }
-    oQEnd += l + 1;
-  }
-  oQEnd += 4; // QTYPE + QCLASS
+  oQEnd = decodeName(qv, 12).nextOff + 4;
 
   const targetWire = encodeDomainName(targetDomain);
-
-  // Calculate total size
-  const cnameSize = 2 + 10 + targetWire.length; // ptr + fixed fields + rdata
+  const cnameSize = 2 + 10 + targetWire.length;
   let ansSize = 0;
   for (const rec of ansRecords) ansSize += targetWire.length + 10 + rec.rdata.length;
 
   const res = new Uint8Array(oQEnd + cnameSize + ansSize);
-
-  // Header + question from original query
   res.set(qv.subarray(0, oQEnd));
-  res[2] = 0x80 | (qv[2] & 0x7F); // QR=1, mirror flags
-  res[3] = uv[3]; // RA + RCODE from upstream
-  res[4] = 0; res[5] = 1; // QDCOUNT = 1
+  res[2] = 0x80 | (qv[2] & 0x7F);
+  res[3] = uv[3];
+  res[4] = 0; res[5] = 1;
   const newAnCount = 1 + ansRecords.length;
   res[6] = (newAnCount >> 8) & 0xFF;
   res[7] = newAnCount & 0xFF;
-  res[8] = 0; res[9] = 0;   // NSCOUNT = 0
-  res[10] = 0; res[11] = 0; // ARCOUNT = 0
+  res[8] = 0; res[9] = 0;
+  res[10] = 0; res[11] = 0;
 
   let off = oQEnd;
-
-  // CNAME record: NAME = pointer 0xC00C (original QNAME at byte 12)
-  res[off++] = 0xC0; res[off++] = 0x0C;
-  res[off++] = 0x00; res[off++] = 0x05; // TYPE = CNAME
-  res[off++] = 0x00; res[off++] = 0x01; // CLASS = IN
+  res[off++] = 0xC0; res[off++] = 0x0C; // Pointer to original query name
+  res[off++] = 0x00; res[off++] = 0x05; // TYPE CNAME
+  res[off++] = 0x00; res[off++] = 0x01; // CLASS IN
   res[off++] = 0x00; res[off++] = 0x00;
-  res[off++] = 0x01; res[off++] = 0x2C; // TTL = 300
+  res[off++] = 0x01; res[off++] = 0x2C; // TTL 300
   res[off++] = (targetWire.length >> 8) & 0xFF;
   res[off++] = targetWire.length & 0xFF;
   res.set(targetWire, off); off += targetWire.length;
 
-  // Answer records from upstream with uncompressed target domain NAME
   for (const rec of ansRecords) {
-    res.set(targetWire, off); off += targetWire.length; // NAME
+    res.set(targetWire, off); off += targetWire.length;
     res[off++] = (rec.type >> 8) & 0xFF; res[off++] = rec.type & 0xFF;
     res[off++] = (rec.cls >> 8) & 0xFF; res[off++] = rec.cls & 0xFF;
     res[off++] = (rec.ttl >> 24) & 0xFF; res[off++] = (rec.ttl >> 16) & 0xFF;
@@ -638,9 +659,9 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
     res[off++] = (rec.rdata.length >> 8) & 0xFF; res[off++] = rec.rdata.length & 0xFF;
     res.set(rec.rdata, off); off += rec.rdata.length;
   }
-
   return res.buffer;
 }
+
 
 // ==================== DNS FORWARDING ====================
 async function forwardQuery(query, upstream) {
